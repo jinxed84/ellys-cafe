@@ -910,10 +910,48 @@ const isTileWalkable = (occupancyMap, gridX, gridZ, gridWidth, gridHeight) => {
   return !isTileOccupied(occupancyMap, gridX, gridZ);
 };
 
+// Find an adjacent walkable tile for delivering to a customer (next to chair, not on it)
+const getDeliveryTile = (occupancyMap, chairX, chairZ, gridWidth, gridHeight) => {
+  // Try adjacent tiles in order of preference (front, sides, back)
+  const adjacentOffsets = [
+    { dx: 0, dz: 1 },   // Front (toward cafe)
+    { dx: 1, dz: 0 },   // Right
+    { dx: -1, dz: 0 },  // Left
+    { dx: 0, dz: -1 },  // Back (toward kitchen)
+    { dx: 1, dz: 1 },   // Front-right diagonal
+    { dx: -1, dz: 1 },  // Front-left diagonal
+    { dx: 1, dz: -1 },  // Back-right diagonal
+    { dx: -1, dz: -1 }, // Back-left diagonal
+  ];
+  
+  for (const offset of adjacentOffsets) {
+    const testX = chairX + offset.dx;
+    const testZ = chairZ + offset.dz;
+    
+    // Check bounds and walkability
+    if (testX >= 0 && testX < gridWidth && testZ >= 0 && testZ < gridHeight) {
+      if (!isTileOccupied(occupancyMap, testX, testZ)) {
+        return { gridX: testX, gridZ: testZ };
+      }
+    }
+  }
+  
+  // Fallback: return the chair position itself (waiter will walk onto customer)
+  return { gridX: chairX, gridZ: chairZ };
+};
+
 // Get the most urgent waiting customer (lowest patience = most urgent, or longest wait time)
-// Returns the table with the customer who should be served next
-const getMostUrgentCustomer = (tables) => {
-  const waitingTables = tables.filter(t => t.customer?.state === 'waiting');
+// Filters out customers already being served by a waiter (locked)
+// excludeTableId: optional table to exclude (e.g., current delivery target)
+// lockedTableIds: array of tableIds already targeted by other waiters
+const getMostUrgentCustomer = (tables, excludeTableId = null, lockedTableIds = []) => {
+  const waitingTables = tables.filter(t => {
+    if (!t.customer || t.customer.state !== 'waiting') return false;
+    if (excludeTableId && t.id === excludeTableId) return false;
+    if (lockedTableIds.includes(t.id)) return false; // Skip customers already targeted by another waiter
+    return true;
+  });
+  
   if (waitingTables.length === 0) return null;
   
   // Sort by patience (lowest first = most urgent)
@@ -934,6 +972,13 @@ const getMostUrgentCustomer = (tables) => {
   });
   
   return waitingTables[0];
+};
+
+// Get all table IDs currently being targeted by waiters (to prevent double-serving)
+const getLockedTableIds = (waiters, excludeWaiterId = null) => {
+  return waiters
+    .filter(w => w.id !== excludeWaiterId && w.targetTableId)
+    .map(w => w.targetTableId);
 };
 
 // A* Pathfinding Algorithm
@@ -1403,16 +1448,20 @@ const initialState = {
   level: 1,
   buzz: 50, // Starts at 50, not 0!
   
-  // Waiter - delivers food from counters to customers
-  waiter: {
-    state: 'idle', // idle, walking_to_counter, walking_to_table, pacing, returning
-    gridX: 10, gridZ: 1, // Start in front of counters (counters are at gridZ 0)
-    targetCounterId: null,
-    targetTableId: null,
-    carryingFood: null, // { recipe } when carrying food
-    path: [],
-    walkProgress: 0,
-  },
+  // Waiters - deliver food from counters to customers (can hire more!)
+  waiters: [
+    {
+      id: 'waiter-1',
+      state: 'idle', // idle, walking_to_counter, walking_to_table, pacing, returning
+      gridX: 10, gridZ: 1, // Start in front of counters
+      targetCounterId: null,
+      targetTableId: null, // Customer is "locked" when waiter targets them
+      carryingFood: null, // { recipe } when carrying food
+      path: [],
+      walkProgress: 0,
+    }
+  ],
+  maxWaiters: 5, // Maximum hireable waiters
   
   // Avatar customization
   avatar: {
@@ -1486,7 +1535,10 @@ const initialState = {
   
   decorations: [], // Player-placed decorations
   dividers: [], // Player-placed dividers (block pathfinding)
-  doors: [], // Player-placed doors (customer entry/exit points)
+  doors: [
+    // Default starting door on left wall (visible, customers enter/exit here)
+    { id: 'door-initial', type: 'basicDoor', wall: 'left', wallPosition: 11 }
+  ],
   wallpaper: 'cream', // Default interior wallpaper style (for unpainted segments)
   paintedSegments: [], // Individual painted segments: [{ wall: 'back', position: 0, wallpaper: 'cerulean' }, ...]
   paintedVersion: 0, // Increments on every paint change to trigger updates
@@ -2035,46 +2087,75 @@ function gameReducer(state, action) {
     }
     
     // ============ WAITER ACTIONS ============
-    // Simple: idle → walking_to_counter → walking_to_table → idle
+    // Each action now includes waiterId to update specific waiter in array
+    // Locking: targetTableId "locks" a customer so other waiters won't serve them
+    
+    case 'HIRE_WAITER': {
+      // Cost increases: 1000, 2000, 3000, etc.
+      const waiterCount = state.waiters.length;
+      const cost = (waiterCount) * 1000;
+      
+      if (state.coins < cost || waiterCount >= state.maxWaiters) return state;
+      
+      // Position new waiter near counters with slight offset
+      const newWaiter = {
+        id: `waiter-${waiterCount + 1}`,
+        state: 'idle',
+        gridX: 9 + (waiterCount % 5), // Spread them out
+        gridZ: 1,
+        targetCounterId: null,
+        targetTableId: null,
+        carryingFood: null,
+        path: [],
+        walkProgress: 0,
+      };
+      
+      return {
+        ...state,
+        coins: state.coins - cost,
+        waiters: [...state.waiters, newWaiter],
+      };
+    }
     
     case 'WAITER_GO_TO_COUNTER': {
-      const { counterId, tableId, path } = action.payload;
+      const { waiterId, counterId, tableId, path } = action.payload;
       if (!path || path.length === 0) return state;
       
       return {
         ...state,
-        waiter: {
-          ...state.waiter,
-          state: 'walking_to_counter',
-          targetCounterId: counterId,
-          targetTableId: tableId, // Remember which customer we're serving
-          path,
-          pathIndex: 0,
-          walkProgress: 0,
-        },
+        waiters: state.waiters.map(w => 
+          w.id === waiterId ? {
+            ...w,
+            state: 'walking_to_counter',
+            targetCounterId: counterId,
+            targetTableId: tableId, // This "locks" the customer
+            path,
+            pathIndex: 0,
+            walkProgress: 0,
+          } : w
+        ),
       };
     }
     
     case 'WAITER_PICKUP_AND_GO': {
-      // Waiter reached counter, pick up ONE serving and start walking to table
-      const { counterId, tableId, pathToTable } = action.payload;
+      const { waiterId, counterId, tableId, pathToTable } = action.payload;
       
-      // Guard: must be walking_to_counter
-      if (state.waiter.state !== 'walking_to_counter') return state;
+      const waiter = state.waiters.find(w => w.id === waiterId);
+      if (!waiter || waiter.state !== 'walking_to_counter') return state;
       
       const counter = state.counters.find(c => c.id === counterId);
       if (!counter || counter.dishes.length === 0 || !pathToTable || pathToTable.length === 0) {
-        // No food or no path, go idle
         return {
           ...state,
-          waiter: { ...state.waiter, state: 'idle', path: [], carryingFood: null },
+          waiters: state.waiters.map(w => 
+            w.id === waiterId ? { ...w, state: 'idle', path: [], carryingFood: null, targetTableId: null } : w
+          ),
         };
       }
       
-      // Take ONE serving (same logic as SERVE_CUSTOMER)
       const dish = counter.dishes[0];
       const newServings = dish.servings - 1;
-      const finalCounterTile = state.waiter.path[state.waiter.path.length - 1];
+      const finalCounterTile = waiter.path[waiter.path.length - 1];
       
       return {
         ...state,
@@ -2085,36 +2166,39 @@ function gameReducer(state, action) {
                 : c.dishes.slice(1) }
             : c
         ),
-        waiter: {
-          ...state.waiter,
-          state: 'walking_to_table',
-          gridX: finalCounterTile?.x ?? state.waiter.gridX,
-          gridZ: finalCounterTile?.z ?? state.waiter.gridZ,
-          carryingFood: { recipe: dish.recipe },
-          path: pathToTable,
-          pathIndex: 0,
-          walkProgress: 0,
-        },
+        waiters: state.waiters.map(w => 
+          w.id === waiterId ? {
+            ...w,
+            state: 'walking_to_table',
+            gridX: finalCounterTile?.gridX ?? finalCounterTile?.x ?? w.gridX,
+            gridZ: finalCounterTile?.gridZ ?? finalCounterTile?.z ?? w.gridZ,
+            carryingFood: { recipe: dish.recipe },
+            path: pathToTable,
+            pathIndex: 0,
+            walkProgress: 0,
+          } : w
+        ),
       };
     }
     
     case 'WAITER_SERVE_CUSTOMER': {
-      // Waiter reached table, give food to customer
-      const { tableId } = action.payload;
+      const { waiterId, tableId } = action.payload;
       
-      // Guard: must be walking_to_table and carrying food
-      if (state.waiter.state !== 'walking_to_table' || !state.waiter.carryingFood) return state;
+      const waiter = state.waiters.find(w => w.id === waiterId);
+      if (!waiter || waiter.state !== 'walking_to_table' || !waiter.carryingFood) return state;
       
       const table = state.tables.find(t => t.id === tableId);
       if (!table || !table.customer) {
         return {
           ...state,
-          waiter: { ...state.waiter, state: 'idle', path: [], carryingFood: null },
+          waiters: state.waiters.map(w => 
+            w.id === waiterId ? { ...w, state: 'idle', path: [], carryingFood: null, targetTableId: null } : w
+          ),
         };
       }
       
-      const recipe = RECIPES[state.waiter.carryingFood.recipe];
-      const finalTile = state.waiter.path[state.waiter.path.length - 1];
+      const recipe = RECIPES[waiter.carryingFood.recipe];
+      const finalTile = waiter.path[waiter.path.length - 1];
       
       return {
         ...state,
@@ -2123,18 +2207,20 @@ function gameReducer(state, action) {
             ? { ...t, customer: { ...t.customer, state: 'eating', eatStartTime: Date.now() } }
             : t
         ),
-        waiter: {
-          ...state.waiter,
-          state: 'idle', // Just go idle where we are
-          gridX: finalTile?.x ?? state.waiter.gridX,
-          gridZ: finalTile?.z ?? state.waiter.gridZ,
-          carryingFood: null,
-          targetCounterId: null,
-          targetTableId: null,
-          path: [],
-          pathIndex: 0,
-          walkProgress: 0,
-        },
+        waiters: state.waiters.map(w => 
+          w.id === waiterId ? {
+            ...w,
+            state: 'idle',
+            gridX: finalTile?.gridX ?? finalTile?.x ?? w.gridX,
+            gridZ: finalTile?.gridZ ?? finalTile?.z ?? w.gridZ,
+            carryingFood: null,
+            targetCounterId: null,
+            targetTableId: null, // Release lock
+            path: [],
+            pathIndex: 0,
+            walkProgress: 0,
+          } : w
+        ),
         coins: state.coins + recipe.revenue,
         stats: { 
           ...state.stats, 
@@ -2146,60 +2232,68 @@ function gameReducer(state, action) {
     }
     
     case 'WAITER_UPDATE_POSITION': {
-      const { gridX, gridZ, walkProgress } = action.payload;
+      const { waiterId, gridX, gridZ, walkProgress } = action.payload;
       return {
         ...state,
-        waiter: {
-          ...state.waiter,
-          gridX: gridX ?? state.waiter.gridX,
-          gridZ: gridZ ?? state.waiter.gridZ,
-          walkProgress: walkProgress ?? state.waiter.walkProgress,
-        },
+        waiters: state.waiters.map(w => 
+          w.id === waiterId ? {
+            ...w,
+            gridX: gridX ?? w.gridX,
+            gridZ: gridZ ?? w.gridZ,
+            walkProgress: walkProgress ?? w.walkProgress,
+          } : w
+        ),
       };
     }
     
     case 'WAITER_START_PACING': {
-      const { path } = action.payload;
+      const { waiterId, path } = action.payload;
       return {
         ...state,
-        waiter: {
-          ...state.waiter,
-          state: 'pacing',
-          path: path || [],
-          walkProgress: 0,
-        },
+        waiters: state.waiters.map(w => 
+          w.id === waiterId ? {
+            ...w,
+            state: 'pacing',
+            path: path || [],
+            walkProgress: 0,
+          } : w
+        ),
       };
     }
     
     case 'WAITER_GO_IDLE': {
+      const { waiterId } = action.payload;
       return {
         ...state,
-        waiter: {
-          ...state.waiter,
-          state: 'idle',
-          path: [],
-          walkProgress: 0,
-        },
+        waiters: state.waiters.map(w => 
+          w.id === waiterId ? {
+            ...w,
+            state: 'idle',
+            path: [],
+            walkProgress: 0,
+            targetTableId: null, // Release lock when going idle
+          } : w
+        ),
       };
     }
     
     case 'WAITER_SERVE_AND_RETURN': {
-      const { tableId, finalX, finalZ, returnPath } = action.payload;
+      const { waiterId, tableId, finalX, finalZ, returnPath } = action.payload;
       
-      // Guard: must be walking_to_table and carrying food
-      if (state.waiter.state !== 'walking_to_table' || !state.waiter.carryingFood) return state;
+      const waiter = state.waiters.find(w => w.id === waiterId);
+      if (!waiter || waiter.state !== 'walking_to_table' || !waiter.carryingFood) return state;
       
       const table = state.tables.find(t => t.id === tableId);
       if (!table || !table.customer) {
         return {
           ...state,
-          waiter: { ...state.waiter, state: 'idle', path: [], carryingFood: null, gridX: finalX, gridZ: finalZ },
+          waiters: state.waiters.map(w => 
+            w.id === waiterId ? { ...w, state: 'idle', path: [], carryingFood: null, gridX: finalX, gridZ: finalZ, targetTableId: null } : w
+          ),
         };
       }
       
-      const recipe = RECIPES[state.waiter.carryingFood.recipe];
-      
-      // Check if we have a valid return path (at least 2 tiles to walk)
+      const recipe = RECIPES[waiter.carryingFood.recipe];
       const hasValidPath = returnPath && returnPath.length >= 2;
       
       return {
@@ -2209,17 +2303,19 @@ function gameReducer(state, action) {
             ? { ...t, customer: { ...t.customer, state: 'eating', eatStartTime: Date.now() } }
             : t
         ),
-        waiter: {
-          ...state.waiter,
-          state: hasValidPath ? 'returning' : 'idle', // Only walk if we have a path
-          gridX: finalX, // Stay at table position - will be updated as we walk
-          gridZ: finalZ,
-          carryingFood: null,
-          targetCounterId: null,
-          targetTableId: null,
-          path: hasValidPath ? returnPath : [],
-          walkProgress: 0,
-        },
+        waiters: state.waiters.map(w => 
+          w.id === waiterId ? {
+            ...w,
+            state: hasValidPath ? 'returning' : 'idle',
+            gridX: finalX,
+            gridZ: finalZ,
+            carryingFood: null,
+            targetCounterId: null,
+            targetTableId: null, // Release lock after serving
+            path: hasValidPath ? returnPath : [],
+            walkProgress: 0,
+          } : w
+        ),
         coins: state.coins + recipe.revenue,
         stats: { 
           ...state.stats, 
@@ -2231,21 +2327,22 @@ function gameReducer(state, action) {
     }
     
     case 'WAITER_SERVE_AND_CONTINUE': {
-      // Serve current customer AND immediately start walking to next counter (no idle wait!)
-      const { tableId, finalX, finalZ, nextCounterId, nextTableId, pathToCounter } = action.payload;
+      const { waiterId, tableId, finalX, finalZ, nextCounterId, nextTableId, pathToCounter } = action.payload;
       
-      // Guard: must be walking_to_table and carrying food
-      if (state.waiter.state !== 'walking_to_table' || !state.waiter.carryingFood) return state;
+      const waiter = state.waiters.find(w => w.id === waiterId);
+      if (!waiter || waiter.state !== 'walking_to_table' || !waiter.carryingFood) return state;
       
       const table = state.tables.find(t => t.id === tableId);
       if (!table || !table.customer) {
         return {
           ...state,
-          waiter: { ...state.waiter, state: 'idle', path: [], carryingFood: null, gridX: finalX, gridZ: finalZ },
+          waiters: state.waiters.map(w => 
+            w.id === waiterId ? { ...w, state: 'idle', path: [], carryingFood: null, gridX: finalX, gridZ: finalZ, targetTableId: null } : w
+          ),
         };
       }
       
-      const recipe = RECIPES[state.waiter.carryingFood.recipe];
+      const recipe = RECIPES[waiter.carryingFood.recipe];
       const hasValidPath = pathToCounter && pathToCounter.length >= 1;
       
       return {
@@ -2255,18 +2352,19 @@ function gameReducer(state, action) {
             ? { ...t, customer: { ...t.customer, state: 'eating', eatStartTime: Date.now() } }
             : t
         ),
-        waiter: {
-          ...state.waiter,
-          // Go DIRECTLY to walking_to_counter - skip idle/returning entirely!
-          state: hasValidPath ? 'walking_to_counter' : 'idle',
-          gridX: finalX,
-          gridZ: finalZ,
-          carryingFood: null, // Just delivered, not carrying
-          targetCounterId: nextCounterId,
-          targetTableId: nextTableId,
-          path: hasValidPath ? pathToCounter : [],
-          walkProgress: 0,
-        },
+        waiters: state.waiters.map(w => 
+          w.id === waiterId ? {
+            ...w,
+            state: hasValidPath ? 'walking_to_counter' : 'idle',
+            gridX: finalX,
+            gridZ: finalZ,
+            carryingFood: null,
+            targetCounterId: nextCounterId,
+            targetTableId: nextTableId, // Lock new customer
+            path: hasValidPath ? pathToCounter : [],
+            walkProgress: 0,
+          } : w
+        ),
         coins: state.coins + recipe.revenue,
         stats: { 
           ...state.stats, 
@@ -2801,18 +2899,25 @@ function gameReducer(state, action) {
         counters: (gs.counters || state.counters).map(c => ({ ...c, rotation: c.rotation || 0 })),
         tables: loadedTables,
         chairs: migratedChairs,
-        waiter: { // Reset waiter to idle on load
+        waiters: (gs.waiters || [{ id: 'waiter-1' }]).map(w => ({ 
+          // Reset each waiter to idle on load
+          id: w.id || 'waiter-1',
           state: 'idle',
-          gridX: 10, gridZ: 1, // In front of counters
+          gridX: w.gridX || 10, 
+          gridZ: w.gridZ || 1,
           targetCounterId: null,
           targetTableId: null,
           carryingFood: null,
           path: [],
           walkProgress: 0,
-        },
+        })),
+        maxWaiters: gs.maxWaiters || 5,
         decorations: gs.decorations || [],
         dividers: gs.dividers || [],
-        doors: gs.doors || [],
+        // Ensure at least one door exists (migration for old saves)
+        doors: (gs.doors && gs.doors.length > 0) 
+          ? gs.doors 
+          : [{ id: 'door-initial', type: 'basicDoor', wall: 'left', wallPosition: 11 }],
         wallpaper: gs.wallpaper || 'cream',
         paintedSegments: gs.paintedSegments || [],
         paintedVersion: gs.paintedVersion || 0,
@@ -7843,13 +7948,17 @@ function CafeWorld3D() {
       waypoints: [],
     };
     
-    // Create waiter
-    const waiterObj = createWaiter(false);
-    const waiterHomeX = gameState.waiter.homeX - GRID.width / 2 + 0.5;
-    const waiterHomeZ = gameState.waiter.homeZ - GRID.height / 2 + 0.5;
-    waiterObj.position.set(waiterHomeX, 0, waiterHomeZ);
-    scene.add(waiterObj);
-    objectsRef.current.waiter = waiterObj;
+    // Create waiters (one for each in the array)
+    objectsRef.current.waiters = {};
+    gameState.waiters.forEach(waiter => {
+      const waiterObj = createWaiter(false);
+      const waiterX = waiter.gridX - GRID.width / 2 + 0.5;
+      const waiterZ = waiter.gridZ - GRID.height / 2 + 0.5;
+      waiterObj.position.set(waiterX, 0, waiterZ);
+      waiterObj.userData = { id: waiter.id };
+      scene.add(waiterObj);
+      objectsRef.current.waiters[waiter.id] = waiterObj;
+    });
     
     // Animation loop
     let animationId;
@@ -8906,10 +9015,36 @@ function CafeWorld3D() {
       }
     });
     
-    // Update waiter position and appearance
-    const waiterObj = objectsRef.current.waiter;
-    const waiter = gameState.waiter;
-    if (waiterObj && waiter) {
+    // Update waiter positions and appearance (handle multiple waiters)
+    // First, ensure all waiters have 3D objects
+    const currentWaiterIds = new Set(gameState.waiters.map(w => w.id));
+    
+    // Remove waiter objects that no longer exist
+    Object.entries(objectsRef.current.waiters || {}).forEach(([id, obj]) => {
+      if (!currentWaiterIds.has(id)) {
+        scene.remove(obj);
+        delete objectsRef.current.waiters[id];
+      }
+    });
+    
+    // Add new waiters that don't have objects yet (e.g., newly hired)
+    gameState.waiters.forEach(waiter => {
+      if (!objectsRef.current.waiters[waiter.id]) {
+        const newWaiterObj = createWaiter(false);
+        const waiterX = waiter.gridX - GRID.width / 2 + 0.5;
+        const waiterZ = waiter.gridZ - GRID.height / 2 + 0.5;
+        newWaiterObj.position.set(waiterX, 0, waiterZ);
+        newWaiterObj.userData = { id: waiter.id };
+        scene.add(newWaiterObj);
+        objectsRef.current.waiters[waiter.id] = newWaiterObj;
+      }
+    });
+    
+    // Update each waiter's position and appearance
+    gameState.waiters.forEach(waiter => {
+      const waiterObj = objectsRef.current.waiters[waiter.id];
+      if (!waiterObj) return;
+      
       const isCarrying = waiter.carryingFood !== null;
       
       // Show/hide carrying plate
@@ -8956,8 +9091,9 @@ function CafeWorld3D() {
             waiterObj.rotation.y = Math.atan2(dx, dz);
           }
           
-          // Walking bob animation
-          waiterObj.position.y = Math.abs(Math.sin(Date.now() * 0.012)) * 0.06;
+          // Walking bob animation (offset by waiter index for variety)
+          const waiterIndex = gameState.waiters.findIndex(w => w.id === waiter.id);
+          waiterObj.position.y = Math.abs(Math.sin(Date.now() * 0.012 + waiterIndex * 0.5)) * 0.06;
         }
       } else if (isWalking && waiter.path && waiter.path.length === 1) {
         // Single tile path - just go there
@@ -8972,7 +9108,7 @@ function CafeWorld3D() {
         waiterObj.position.set(worldX, 0, worldZ);
         waiterObj.position.y = 0; // No bob when idle
       }
-    }
+    });
     
     // Update decorations
     const currentDecorIds = new Set(gameState.decorations.map(d => d.id));
@@ -9559,219 +9695,253 @@ function CafeWorld3D() {
       }
       
       // ============ WAITER LOGIC ============
-      // Loop: idle → walking_to_counter → walking_to_table → returning → idle (pacing)
-      const waiter = gameState.waiter;
+      // Loop through ALL waiters - each operates independently
+      // Locking: targetTableId prevents multiple waiters from serving same customer
+      // IMPORTANT: Track tables claimed THIS TICK to prevent race conditions
+      // (React state is async, so we need synchronous tracking within the loop)
+      const tablesClaimedThisTick = [];
       
-      if (waiter.state === 'idle') {
-        // Look for work: food on counter AND waiting customer
-        const countersWithFood = gameState.counters.filter(c => c.dishes.length > 0);
-        const targetTable = getMostUrgentCustomer(gameState.tables); // Prioritize by patience!
+      gameState.waiters.forEach(waiter => {
+        // Get list of tables already being served by OTHER waiters (from state)
+        // PLUS tables claimed by earlier waiters in THIS tick (prevents sync/overlap)
+        const lockedTableIds = [
+          ...getLockedTableIds(gameState.waiters, waiter.id),
+          ...tablesClaimedThisTick
+        ];
         
-        if (countersWithFood.length > 0 && targetTable) {
-          // Work to do! Go get food for the most urgent customer
-          const counter = countersWithFood[0];
-          
-          const counterTile = getInteractionTile('counter', counter.gridX, counter.gridZ, counter.rotation || 0);
-          const occupancyMap = buildOccupancyMap(gameState);
-          occupancyMap.delete(getTileKey(waiter.gridX, waiter.gridZ));
-          
-          const pathToCounter = findPath(occupancyMap, waiter.gridX, waiter.gridZ, 
-            counterTile.gridX, counterTile.gridZ, GRID.width, GRID.height);
-          
-          if (pathToCounter && pathToCounter.length > 0) {
-            dispatch({ type: 'WAITER_GO_TO_COUNTER', payload: { 
-              counterId: counter.id, 
-              tableId: targetTable.id,
-              path: pathToCounter 
-            }});
-          }
-        } else {
-          // No work - pace near counters if not already there
-          // Counters are at gridZ 0, so waiter should be at gridZ 1 (right in front)
-          const isNearCounters = waiter.gridZ <= 2;
-          
-          if (!isNearCounters) {
-            // Walk back to counter area (counters are at gridX 9, 11, 13)
-            const targetX = 9 + Math.floor(Math.random() * 5); // Random x 9-13 (near counters)
-            const targetZ = 1; // Right in front of counters
-            
-            const occupancyMap = buildOccupancyMap(gameState);
-            occupancyMap.delete(getTileKey(waiter.gridX, waiter.gridZ));
-            
-            const path = findPath(occupancyMap, waiter.gridX, waiter.gridZ, 
-              targetX, targetZ, GRID.width, GRID.height);
-            
-            if (path && path.length > 1) {
-              dispatch({ type: 'WAITER_START_PACING', payload: { path }});
-            }
-          } else if (Math.random() < 0.01) {
-            // Occasionally pace to a nearby spot (1% chance per tick)
-            const targetX = waiter.gridX + Math.floor(Math.random() * 5) - 2;
-            const clampedX = Math.max(8, Math.min(14, targetX)); // Stay in counter area (8-14)
-            
-            const occupancyMap = buildOccupancyMap(gameState);
-            occupancyMap.delete(getTileKey(waiter.gridX, waiter.gridZ));
-            
-            const path = findPath(occupancyMap, waiter.gridX, waiter.gridZ, 
-              clampedX, waiter.gridZ, GRID.width, GRID.height);
-            
-            if (path && path.length > 1) {
-              dispatch({ type: 'WAITER_START_PACING', payload: { path }});
-            }
-          }
-        }
-      } else if (waiter.state === 'pacing' || waiter.state === 'returning') {
-        // Walking (pacing or returning to counter area)
-        const pathLength = waiter.path?.length || 1;
-        const newProgress = (waiter.walkProgress || 0) + 0.02; // Slower pace
-        
-        if (newProgress >= 1) {
-          // Reached destination
-          const finalTile = waiter.path[waiter.path.length - 1];
-          const newGridX = finalTile?.gridX ?? finalTile?.x ?? waiter.gridX;
-          const newGridZ = finalTile?.gridZ ?? finalTile?.z ?? waiter.gridZ;
-          
-          // If returning from delivery, immediately check for more work (no hesitation!)
-          if (waiter.state === 'returning') {
-            const countersWithFood = gameState.counters.filter(c => c.dishes.length > 0);
-            const targetTable = getMostUrgentCustomer(gameState.tables); // Prioritize by patience!
-            
-            if (countersWithFood.length > 0 && targetTable) {
-              // Work to do! Go directly to counter without idle delay
-              const counter = countersWithFood[0];
-              const counterTile = getInteractionTile('counter', counter.gridX, counter.gridZ, counter.rotation || 0);
-              
-              const occupancyMap = buildOccupancyMap(gameState);
-              occupancyMap.delete(getTileKey(newGridX, newGridZ));
-              
-              const pathToCounter = findPath(occupancyMap, newGridX, newGridZ,
-                counterTile.gridX, counterTile.gridZ, GRID.width, GRID.height);
-              
-              if (pathToCounter && pathToCounter.length > 0) {
-                // Update position and immediately start next job
-                dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { gridX: newGridX, gridZ: newGridZ, walkProgress: 0 }});
-                dispatch({ type: 'WAITER_GO_TO_COUNTER', payload: { 
-                  counterId: counter.id, 
-                  tableId: targetTable.id,
-                  path: pathToCounter 
-                }});
-              } else {
-                // No valid path, just go idle
-                dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { gridX: newGridX, gridZ: newGridZ, walkProgress: 0 }});
-                dispatch({ type: 'WAITER_GO_IDLE', payload: {} });
-              }
-            } else {
-              // No work available, go idle
-              dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { gridX: newGridX, gridZ: newGridZ, walkProgress: 0 }});
-              dispatch({ type: 'WAITER_GO_IDLE', payload: {} });
-            }
-          } else {
-            // Just pacing, go idle
-            dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { gridX: newGridX, gridZ: newGridZ, walkProgress: 0 }});
-            dispatch({ type: 'WAITER_GO_IDLE', payload: {} });
-          }
-        } else {
-          // Update position along path (path uses gridX/gridZ, not x/z)
-          const pathIndex = Math.floor(newProgress * pathLength);
-          const currentTile = waiter.path[Math.min(pathIndex, waiter.path.length - 1)];
-          dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { 
-            gridX: currentTile?.gridX ?? currentTile?.x ?? waiter.gridX, 
-            gridZ: currentTile?.gridZ ?? currentTile?.z ?? waiter.gridZ,
-            walkProgress: newProgress
-          }});
-        }
-      } else if (waiter.state === 'walking_to_counter') {
-        // Walk to counter
-        const pathLength = waiter.path?.length || 1;
-        const newProgress = (waiter.walkProgress || 0) + 0.03;
-        
-        if (newProgress >= 1) {
-          // Reached counter - pick up food and go to table
-          const chair = findChairForTable(
-            gameState.tables.find(t => t.id === waiter.targetTableId), 
-            gameState.chairs || []
-          );
-          const table = gameState.tables.find(t => t.id === waiter.targetTableId);
-          const deliveryX = chair ? chair.gridX : table?.gridX || waiter.gridX;
-          const deliveryZ = chair ? chair.gridZ : table?.gridZ || waiter.gridZ;
-          
-          const finalTile = waiter.path[waiter.path.length - 1];
-          const finalX = finalTile?.gridX ?? finalTile?.x ?? waiter.gridX;
-          const finalZ = finalTile?.gridZ ?? finalTile?.z ?? waiter.gridZ;
-          
-          const occupancyMap = buildOccupancyMap(gameState);
-          occupancyMap.delete(getTileKey(finalX, finalZ));
-          occupancyMap.delete(getTileKey(deliveryX, deliveryZ));
-          
-          const pathToTable = findPath(occupancyMap, finalX, finalZ,
-            deliveryX, deliveryZ, GRID.width, GRID.height);
-          
-          dispatch({ type: 'WAITER_PICKUP_AND_GO', payload: { 
-            counterId: waiter.targetCounterId, 
-            tableId: waiter.targetTableId,
-            pathToTable: pathToTable || []
-          }});
-        } else {
-          // Update position along path (path uses gridX/gridZ, not x/z)
-          const pathIndex = Math.floor(newProgress * pathLength);
-          const currentTile = waiter.path[Math.min(pathIndex, waiter.path.length - 1)];
-          dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { 
-            gridX: currentTile?.gridX ?? currentTile?.x ?? waiter.gridX, 
-            gridZ: currentTile?.gridZ ?? currentTile?.z ?? waiter.gridZ,
-            walkProgress: newProgress
-          }});
-        }
-      } else if (waiter.state === 'walking_to_table') {
-        // Walk to table
-        const pathLength = waiter.path?.length || 1;
-        const newProgress = (waiter.walkProgress || 0) + 0.03;
-        
-        if (newProgress >= 1) {
-          // Reached table - serve customer
-          const finalTile = waiter.path[waiter.path.length - 1];
-          const waiterX = finalTile?.gridX ?? finalTile?.x ?? waiter.gridX;
-          const waiterZ = finalTile?.gridZ ?? finalTile?.z ?? waiter.gridZ;
-          
-          // Check for NEXT job BEFORE deciding where to go
-          // (This is the key - decide next destination at delivery time, not after returning!)
+        if (waiter.state === 'idle') {
+          // Look for work: food on counter AND waiting customer (not locked by another waiter)
           const countersWithFood = gameState.counters.filter(c => c.dishes.length > 0);
-          // Note: current customer is still 'waiting' until we dispatch, so filter them out
-          // Then get the most urgent remaining customer (lowest patience first!)
-          const otherTables = gameState.tables.filter(t => t.id !== waiter.targetTableId);
-          const nextTable = getMostUrgentCustomer(otherTables);
+          const targetTable = getMostUrgentCustomer(gameState.tables, null, lockedTableIds);
           
-          const occupancyMap = buildOccupancyMap(gameState);
-          occupancyMap.delete(getTileKey(waiterX, waiterZ));
-          
-          if (countersWithFood.length > 0 && nextTable) {
-            // MORE WORK! Go directly to counter with food (skip "return to counter area")
-            const counter = countersWithFood[0];
+          if (countersWithFood.length > 0 && targetTable) {
+            // Work to do! Go get food for the most urgent unlocked customer
+            // Pick a RANDOM counter (variety in what customers eat!)
+            const counter = countersWithFood[Math.floor(Math.random() * countersWithFood.length)];
+            
             const counterTile = getInteractionTile('counter', counter.gridX, counter.gridZ, counter.rotation || 0);
+            const occupancyMap = buildOccupancyMap(gameState);
+            occupancyMap.delete(getTileKey(waiter.gridX, waiter.gridZ));
             
-            occupancyMap.delete(getTileKey(counterTile.gridX, counterTile.gridZ));
-            
-            const pathToCounter = findPath(occupancyMap, waiterX, waiterZ,
+            const pathToCounter = findPath(occupancyMap, waiter.gridX, waiter.gridZ, 
               counterTile.gridX, counterTile.gridZ, GRID.width, GRID.height);
             
             if (pathToCounter && pathToCounter.length > 0) {
-              // Serve current customer AND immediately queue up next job
-              dispatch({ type: 'WAITER_SERVE_AND_CONTINUE', payload: { 
-                tableId: waiter.targetTableId,
-                finalX: waiterX,
-                finalZ: waiterZ,
-                nextCounterId: counter.id,
-                nextTableId: nextTable.id,
-                pathToCounter: pathToCounter
+              // CLAIM this table immediately (before state updates)
+              tablesClaimedThisTick.push(targetTable.id);
+              
+              dispatch({ type: 'WAITER_GO_TO_COUNTER', payload: { 
+                waiterId: waiter.id,
+                counterId: counter.id, 
+                tableId: targetTable.id,
+                path: pathToCounter 
               }});
-              SFX.customerServed();
+            }
+          } else {
+            // No work - pace near counters if not already there
+            const isNearCounters = waiter.gridZ <= 2;
+            
+            if (!isNearCounters) {
+              // Walk back to counter area
+              const targetX = 9 + Math.floor(Math.random() * 5);
+              const targetZ = 1;
+              
+              const occupancyMap = buildOccupancyMap(gameState);
+              occupancyMap.delete(getTileKey(waiter.gridX, waiter.gridZ));
+              
+              const path = findPath(occupancyMap, waiter.gridX, waiter.gridZ, 
+                targetX, targetZ, GRID.width, GRID.height);
+              
+              if (path && path.length > 1) {
+                dispatch({ type: 'WAITER_START_PACING', payload: { waiterId: waiter.id, path }});
+              }
+            } else if (Math.random() < 0.01) {
+              // Occasionally pace to a nearby spot (1% chance per tick)
+              const targetX = waiter.gridX + Math.floor(Math.random() * 5) - 2;
+              const clampedX = Math.max(8, Math.min(14, targetX));
+              
+              const occupancyMap = buildOccupancyMap(gameState);
+              occupancyMap.delete(getTileKey(waiter.gridX, waiter.gridZ));
+              
+              const path = findPath(occupancyMap, waiter.gridX, waiter.gridZ, 
+                clampedX, waiter.gridZ, GRID.width, GRID.height);
+              
+              if (path && path.length > 1) {
+                dispatch({ type: 'WAITER_START_PACING', payload: { waiterId: waiter.id, path }});
+              }
+            }
+          }
+        } else if (waiter.state === 'pacing' || waiter.state === 'returning') {
+          // Walking (pacing or returning to counter area)
+          const pathLength = waiter.path?.length || 1;
+          const newProgress = (waiter.walkProgress || 0) + 0.02;
+          
+          if (newProgress >= 1) {
+            const finalTile = waiter.path[waiter.path.length - 1];
+            const newGridX = finalTile?.gridX ?? finalTile?.x ?? waiter.gridX;
+            const newGridZ = finalTile?.gridZ ?? finalTile?.z ?? waiter.gridZ;
+            
+            // If returning from delivery, immediately check for more work
+            if (waiter.state === 'returning') {
+              const countersWithFood = gameState.counters.filter(c => c.dishes.length > 0);
+              const targetTable = getMostUrgentCustomer(gameState.tables, null, lockedTableIds);
+              
+              if (countersWithFood.length > 0 && targetTable) {
+                // CLAIM this table immediately (before state updates)
+                tablesClaimedThisTick.push(targetTable.id);
+                
+                // Pick a RANDOM counter (variety!)
+                const counter = countersWithFood[Math.floor(Math.random() * countersWithFood.length)];
+                const counterTile = getInteractionTile('counter', counter.gridX, counter.gridZ, counter.rotation || 0);
+                
+                const occupancyMap = buildOccupancyMap(gameState);
+                occupancyMap.delete(getTileKey(newGridX, newGridZ));
+                
+                const pathToCounter = findPath(occupancyMap, newGridX, newGridZ,
+                  counterTile.gridX, counterTile.gridZ, GRID.width, GRID.height);
+                
+                if (pathToCounter && pathToCounter.length > 0) {
+                  dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { waiterId: waiter.id, gridX: newGridX, gridZ: newGridZ, walkProgress: 0 }});
+                  dispatch({ type: 'WAITER_GO_TO_COUNTER', payload: { 
+                    waiterId: waiter.id,
+                    counterId: counter.id, 
+                    tableId: targetTable.id,
+                    path: pathToCounter 
+                  }});
+                } else {
+                  dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { waiterId: waiter.id, gridX: newGridX, gridZ: newGridZ, walkProgress: 0 }});
+                  dispatch({ type: 'WAITER_GO_IDLE', payload: { waiterId: waiter.id } });
+                }
+              } else {
+                dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { waiterId: waiter.id, gridX: newGridX, gridZ: newGridZ, walkProgress: 0 }});
+                dispatch({ type: 'WAITER_GO_IDLE', payload: { waiterId: waiter.id } });
+              }
             } else {
-              // Can't path to counter, just return to counter area
+              dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { waiterId: waiter.id, gridX: newGridX, gridZ: newGridZ, walkProgress: 0 }});
+              dispatch({ type: 'WAITER_GO_IDLE', payload: { waiterId: waiter.id } });
+            }
+          } else {
+            const pathIndex = Math.floor(newProgress * pathLength);
+            const currentTile = waiter.path[Math.min(pathIndex, waiter.path.length - 1)];
+            dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { 
+              waiterId: waiter.id,
+              gridX: currentTile?.gridX ?? currentTile?.x ?? waiter.gridX, 
+              gridZ: currentTile?.gridZ ?? currentTile?.z ?? waiter.gridZ,
+              walkProgress: newProgress
+            }});
+          }
+        } else if (waiter.state === 'walking_to_counter') {
+          // Walk to counter
+          const pathLength = waiter.path?.length || 1;
+          const newProgress = (waiter.walkProgress || 0) + 0.03;
+          
+          if (newProgress >= 1) {
+            // Reached counter - pick up food and go to table
+            const chair = findChairForTable(
+              gameState.tables.find(t => t.id === waiter.targetTableId), 
+              gameState.chairs || []
+            );
+            const table = gameState.tables.find(t => t.id === waiter.targetTableId);
+            const customerX = chair ? chair.gridX : table?.gridX || waiter.gridX;
+            const customerZ = chair ? chair.gridZ : table?.gridZ || waiter.gridZ;
+            
+            const finalTile = waiter.path[waiter.path.length - 1];
+            const finalX = finalTile?.gridX ?? finalTile?.x ?? waiter.gridX;
+            const finalZ = finalTile?.gridZ ?? finalTile?.z ?? waiter.gridZ;
+            
+            const occupancyMap = buildOccupancyMap(gameState);
+            occupancyMap.delete(getTileKey(finalX, finalZ)); // Clear waiter's current pos
+            
+            // Find an adjacent tile to deliver from (not ON the customer!)
+            const deliveryTile = getDeliveryTile(occupancyMap, customerX, customerZ, GRID.width, GRID.height);
+            occupancyMap.delete(getTileKey(deliveryTile.gridX, deliveryTile.gridZ));
+            
+            const pathToTable = findPath(occupancyMap, finalX, finalZ,
+              deliveryTile.gridX, deliveryTile.gridZ, GRID.width, GRID.height);
+            
+            dispatch({ type: 'WAITER_PICKUP_AND_GO', payload: { 
+              waiterId: waiter.id,
+              counterId: waiter.targetCounterId, 
+              tableId: waiter.targetTableId,
+              pathToTable: pathToTable || []
+            }});
+          } else {
+            const pathIndex = Math.floor(newProgress * pathLength);
+            const currentTile = waiter.path[Math.min(pathIndex, waiter.path.length - 1)];
+            dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { 
+              waiterId: waiter.id,
+              gridX: currentTile?.gridX ?? currentTile?.x ?? waiter.gridX, 
+              gridZ: currentTile?.gridZ ?? currentTile?.z ?? waiter.gridZ,
+              walkProgress: newProgress
+            }});
+          }
+        } else if (waiter.state === 'walking_to_table') {
+          // Walk to table
+          const pathLength = waiter.path?.length || 1;
+          const newProgress = (waiter.walkProgress || 0) + 0.03;
+          
+          if (newProgress >= 1) {
+            // Reached table - serve customer
+            const finalTile = waiter.path[waiter.path.length - 1];
+            const waiterX = finalTile?.gridX ?? finalTile?.x ?? waiter.gridX;
+            const waiterZ = finalTile?.gridZ ?? finalTile?.z ?? waiter.gridZ;
+            
+            // Check for NEXT job - filter out current customer AND locked customers
+            const countersWithFood = gameState.counters.filter(c => c.dishes.length > 0);
+            const nextTable = getMostUrgentCustomer(gameState.tables, waiter.targetTableId, lockedTableIds);
+            
+            const occupancyMap = buildOccupancyMap(gameState);
+            occupancyMap.delete(getTileKey(waiterX, waiterZ));
+            
+            if (countersWithFood.length > 0 && nextTable) {
+              // CLAIM this table immediately (before state updates)
+              tablesClaimedThisTick.push(nextTable.id);
+              
+              // MORE WORK! Go directly to counter with food
+              // Pick a RANDOM counter (variety!)
+              const counter = countersWithFood[Math.floor(Math.random() * countersWithFood.length)];
+              const counterTile = getInteractionTile('counter', counter.gridX, counter.gridZ, counter.rotation || 0);
+              
+              occupancyMap.delete(getTileKey(counterTile.gridX, counterTile.gridZ));
+              
+              const pathToCounter = findPath(occupancyMap, waiterX, waiterZ,
+                counterTile.gridX, counterTile.gridZ, GRID.width, GRID.height);
+              
+              if (pathToCounter && pathToCounter.length > 0) {
+                dispatch({ type: 'WAITER_SERVE_AND_CONTINUE', payload: { 
+                  waiterId: waiter.id,
+                  tableId: waiter.targetTableId,
+                  finalX: waiterX,
+                  finalZ: waiterZ,
+                  nextCounterId: counter.id,
+                  nextTableId: nextTable.id,
+                  pathToCounter: pathToCounter
+                }});
+                SFX.customerServed();
+              } else {
+                const targetX = 9 + Math.floor(Math.random() * 5);
+                const targetZ = 1;
+                occupancyMap.delete(getTileKey(targetX, targetZ));
+                const returnPath = findPath(occupancyMap, waiterX, waiterZ, targetX, targetZ, GRID.width, GRID.height);
+                
+                dispatch({ type: 'WAITER_SERVE_AND_RETURN', payload: { 
+                  waiterId: waiter.id,
+                  tableId: waiter.targetTableId,
+                  finalX: waiterX,
+                  finalZ: waiterZ,
+                  returnPath: returnPath || []
+                }});
+                SFX.customerServed();
+              }
+            } else {
+              // No more work - return to counter area
               const targetX = 9 + Math.floor(Math.random() * 5);
               const targetZ = 1;
               occupancyMap.delete(getTileKey(targetX, targetZ));
               const returnPath = findPath(occupancyMap, waiterX, waiterZ, targetX, targetZ, GRID.width, GRID.height);
               
               dispatch({ type: 'WAITER_SERVE_AND_RETURN', payload: { 
+                waiterId: waiter.id,
                 tableId: waiter.targetTableId,
                 finalX: waiterX,
                 finalZ: waiterZ,
@@ -9780,31 +9950,17 @@ function CafeWorld3D() {
               SFX.customerServed();
             }
           } else {
-            // No more work - return to counter area
-            const targetX = 9 + Math.floor(Math.random() * 5);
-            const targetZ = 1;
-            occupancyMap.delete(getTileKey(targetX, targetZ));
-            const returnPath = findPath(occupancyMap, waiterX, waiterZ, targetX, targetZ, GRID.width, GRID.height);
-            
-            dispatch({ type: 'WAITER_SERVE_AND_RETURN', payload: { 
-              tableId: waiter.targetTableId,
-              finalX: waiterX,
-              finalZ: waiterZ,
-              returnPath: returnPath || []
+            const pathIndex = Math.floor(newProgress * pathLength);
+            const currentTile = waiter.path[Math.min(pathIndex, waiter.path.length - 1)];
+            dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { 
+              waiterId: waiter.id,
+              gridX: currentTile?.gridX ?? currentTile?.x ?? waiter.gridX, 
+              gridZ: currentTile?.gridZ ?? currentTile?.z ?? waiter.gridZ,
+              walkProgress: newProgress
             }});
-            SFX.customerServed();
           }
-        } else {
-          // Update position along path (path uses gridX/gridZ, not x/z)
-          const pathIndex = Math.floor(newProgress * pathLength);
-          const currentTile = waiter.path[Math.min(pathIndex, waiter.path.length - 1)];
-          dispatch({ type: 'WAITER_UPDATE_POSITION', payload: { 
-            gridX: currentTile?.gridX ?? currentTile?.x ?? waiter.gridX, 
-            gridZ: currentTile?.gridZ ?? currentTile?.z ?? waiter.gridZ,
-            walkProgress: newProgress
-          }});
         }
-      }
+      }); // End waiters forEach
       
       // Process chef's pending serve action (set by animation loop when chef reaches table)
       if (chefStateRef.current?.pendingServe) {
@@ -9832,7 +9988,8 @@ function CafeWorld3D() {
           
           if (countersWithFood.length > 0 && targetTable) {
             // Find counter with food and serve most urgent customer
-            const counter = countersWithFood[0];
+            // Pick a RANDOM counter (variety!)
+            const counter = countersWithFood[Math.floor(Math.random() * countersWithFood.length)];
             
             // Get interaction tile in front of counter
             const counterTile = getInteractionTile('counter', counter.gridX, counter.gridZ, counter.rotation || 0);
@@ -11095,6 +11252,7 @@ function CafeWorld3D() {
                 { id: 'equipment', icon: '🔥', label: 'Kitchen' },
                 { id: 'tables', icon: '🍽️', label: 'Tables' },
                 { id: 'chairs', icon: '🪑', label: 'Chairs' },
+                { id: 'staff', icon: '👔', label: 'Staff' },
                 { id: 'decor', icon: '🌸', label: 'Decor' },
                 { id: 'dividers', icon: '🚧', label: 'Dividers' },
                 { id: 'doors', icon: '🚪', label: 'Doors' },
@@ -11356,6 +11514,111 @@ function CafeWorld3D() {
                       </div>
                     );
                   })}
+                </>
+              )}
+              
+              {/* Staff Category - Hire Waiters */}
+              {shopCategory === 'staff' && (
+                <>
+                  <div style={{ 
+                    minWidth: '130px', 
+                    padding: '12px', 
+                    background: '#f3e5f5', 
+                    borderRadius: '8px', 
+                    textAlign: 'center',
+                  }}>
+                    <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#7b1fa2' }}>
+                      👔 Staff
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#9c27b0', marginTop: '4px' }}>
+                      {gameState.waiters.length} / {gameState.maxWaiters}
+                    </div>
+                  </div>
+                  
+                  {/* Current Waiters */}
+                  {gameState.waiters.map((waiter, index) => (
+                    <div
+                      key={waiter.id}
+                      style={{
+                        minWidth: '120px',
+                        padding: '12px',
+                        border: '2px solid #ce93d8',
+                        borderRadius: '10px',
+                        background: '#fce4ec',
+                        textAlign: 'center',
+                      }}
+                    >
+                      <div style={{ fontSize: '32px', marginBottom: '5px' }}>🧑‍🍳</div>
+                      <div style={{ fontSize: '12px', fontWeight: 'bold' }}>Waiter #{index + 1}</div>
+                      <div style={{ 
+                        fontSize: '10px', 
+                        color: waiter.state === 'idle' ? '#4CAF50' : '#2196F3',
+                        marginTop: '4px',
+                      }}>
+                        {waiter.state === 'idle' ? '😊 Ready' : 
+                         waiter.state === 'walking_to_counter' ? '🚶 To Counter' :
+                         waiter.state === 'walking_to_table' ? '🍽️ Serving' :
+                         waiter.state === 'returning' ? '↩️ Returning' :
+                         waiter.state === 'pacing' ? '🚶 Pacing' : '✓ Active'}
+                      </div>
+                    </div>
+                  ))}
+                  
+                  {/* Hire New Waiter Button */}
+                  {gameState.waiters.length < gameState.maxWaiters && (
+                    <div
+                      onClick={() => {
+                        const cost = gameState.waiters.length * 1000;
+                        if (gameState.coins >= cost) {
+                          dispatch({ type: 'HIRE_WAITER' });
+                          SFX.purchase();
+                        }
+                      }}
+                      style={{
+                        minWidth: '120px',
+                        padding: '12px',
+                        border: gameState.coins >= gameState.waiters.length * 1000 
+                          ? '3px dashed #4CAF50' 
+                          : '3px dashed #ccc',
+                        borderRadius: '10px',
+                        background: gameState.coins >= gameState.waiters.length * 1000 
+                          ? '#e8f5e9' 
+                          : '#f5f5f5',
+                        cursor: gameState.coins >= gameState.waiters.length * 1000 
+                          ? 'pointer' 
+                          : 'not-allowed',
+                        opacity: gameState.coins >= gameState.waiters.length * 1000 ? 1 : 0.6,
+                        textAlign: 'center',
+                        transition: 'all 0.2s',
+                      }}
+                    >
+                      <div style={{ fontSize: '32px', marginBottom: '5px' }}>➕</div>
+                      <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#2e7d32' }}>
+                        Hire Waiter
+                      </div>
+                      <div style={{ fontSize: '14px', color: '#D4A574', fontWeight: 'bold', marginTop: '5px' }}>
+                        🪙 {gameState.waiters.length * 1000}
+                      </div>
+                      <div style={{ fontSize: '10px', color: '#666', marginTop: '4px' }}>
+                        #{gameState.waiters.length + 1} of {gameState.maxWaiters}
+                      </div>
+                    </div>
+                  )}
+                  
+                  {gameState.waiters.length >= gameState.maxWaiters && (
+                    <div style={{
+                      minWidth: '150px',
+                      padding: '15px',
+                      background: '#fff3e0',
+                      borderRadius: '10px',
+                      textAlign: 'center',
+                    }}>
+                      <div style={{ fontSize: '24px' }}>✨</div>
+                      <div style={{ fontSize: '12px', color: '#e65100', fontWeight: 'bold' }}>
+                        Max Staff Reached!
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
               
